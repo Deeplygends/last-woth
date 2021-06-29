@@ -1,11 +1,17 @@
 from __future__ import annotations
+from collections import OrderedDict
 import copy
 import hashlib
+import io
+import itertools
 import logging
 import os
 import platform
 import random
 import shutil
+import subprocess
+import sys
+import struct
 import time
 import zipfile
 from typing import Optional
@@ -13,22 +19,32 @@ from typing import Optional
 
 from Cosmetics import CosmeticsLog, patch_cosmetics
 from EntranceShuffle import set_entrances
+from Dungeon import create_dungeons
 from Fill import distribute_items_restrictive, ShuffleError
-from Goals import update_goal_items, replace_goal_names
-from Hints import build_gossip_hints
+from Goals import update_goal_items, maybe_set_misc_item_hints, replace_goal_names
+from Hints import buildGossipHints
 from HintList import clear_hint_exclusion_cache, misc_item_hint_table, misc_location_hint_table
+from Item import Item
 from ItemPool import generate_itempool
 from MBSDIFFPatch import apply_ootr_3_web_patch
+from HintList import clearHintExclusionCache, misc_item_hint_table, misc_location_hint_table
 from Models import patch_model_adult, patch_model_child
 from N64Patch import create_patch_file, apply_patch_file
+
+
 from Patches import patch_rom
 from Rom import Rom
 from Rules import set_rules, set_shop_rules
+from Plandomizer import Distribution
+from Search import Search, RewindableSearch
+
+from LocationList import set_drop_location_names
 from Settings import Settings
-from SettingsList import logic_tricks
+from SettingsList import setting_infos, logic_tricks
 from Spoiler import Spoiler
 from Utils import default_output_path, is_bundled, run_process, data_path
 from World import World
+
 from version import __version__
 
 
@@ -178,7 +194,12 @@ def make_spoiler(settings: Settings, worlds: list[World]) -> Spoiler:
     if settings.create_spoiler:
         logger.info('Calculating playthrough.')
         spoiler.create_playthrough()
+        #window.update_progress(45)
     if settings.create_spoiler or settings.hints != 'none':
+        window.update_status('Calculating Hint Data')
+        logger.info('Calculating coarse spheres.')
+        compute_coarse_spheres(spoiler)
+        window.update_progress(50)
         logger.info('Calculating hint data.')
         update_goal_items(spoiler)
         build_gossip_hints(spoiler, worlds)
@@ -595,3 +616,355 @@ def diff_roms(settings: Settings, diff_rom_file: str) -> None:
     logger.info(f"Created patchfile at: {output_path}.zpf")
     logger.info('Done. Enjoy.')
     logger.debug('Total Time: %s', time.process_time() - start)
+
+
+def copy_worlds(worlds):
+    worlds = [world.copy() for world in worlds]
+    Item.fix_worlds_after_copy(worlds)
+    return worlds
+
+
+def find_misc_hint_items(spoiler):
+    search = Search([world.state for world in spoiler.worlds])
+    all_locations = [location for world in spoiler.worlds for location in world.get_filled_locations()]
+    for location in search.iter_reachable_locations(all_locations[:]):
+        search.collect(location.item)
+        # include locations that are reachable but not part of the spoiler log playthrough in misc. item hints
+        maybe_set_misc_item_hints(location)
+        all_locations.remove(location)
+    for location in all_locations:
+        # finally, collect unreachable locations for misc. item hints
+        maybe_set_misc_item_hints(location)
+
+
+def compute_coarse_spheres(spoiler):
+    worlds = spoiler.worlds
+    worlds = copy_worlds(worlds)
+    collection_spheres = []
+    
+    # this function tracks spheres in a simplified way: it increments spheres only when "noteworthy" items are collected
+    # "noteworthy" items are defined as follows
+    def is_noteworthy(item):
+        if item.type == "Song":
+            return True
+        if item.type == "Item" and item.advancement:
+            return item.name not in ["Deliver Letter", "Gerudo Membership Card", "Magic Bean"]
+        return False
+     
+    # to keep a readable and useful spoiler log, we only log certain items:
+    def must_be_logged(item, noteworthy):
+        nonlocal collection_spheres, item_locations, spoiler_locations
+        if noteworthy:
+            if item.location in spoiler_locations:
+                return item.location not in collection_spheres[0]
+        else:
+            if item.type == "DungeonReward":
+                return item.location in spoiler_locations
+        return False
+
+    # get list of all of the progressive items that can appear in hints
+    # all_locations: all progressive items. have to collect from these
+    # item_locations: only the ones that should appear as "required"/WotH
+    all_locations = [location for world in worlds for location in world.get_filled_locations()]
+    item_locations = {location for location in all_locations if location.item.majoritem and not location.locked and location.item.name != 'Triforce Piece'}
+    
+    # if the playthrough was generated, filter the list of locations to the
+    # locations in the playthrough. The required locations is a subset of these
+    # locations. Can't use the locations directly since they are location to the
+    # copied spoiler world, so must compare via name and world id
+    if spoiler.playthrough:
+        translate = lambda loc: worlds[loc.world.id].get_location(loc.name)
+        spoiler_locations = set(map(translate, itertools.chain.from_iterable(spoiler.playthrough.values())))
+        item_locations &= spoiler_locations
+    else:
+        spoiler_locations = all_locations
+    
+    search = Search([world.state for world in worlds])
+
+    # Create "-1" sphere
+    sphere_number = -1
+    collection_spheres.append({})
+    
+    distribution = spoiler.settings.distribution.world_dists[0]
+    for (name, record) in distribution.starting_items.items():
+        item = Item(name, world=worlds[0])
+        search.state_list[0].collect(item)
+
+    item = worlds[0].get_location("Links Pocket").item
+    search.state_list[0].collect(item)
+    collection_spheres[-1][item.location] = item.name
+
+    if spoiler.settings.skip_child_zelda:
+        location = worlds[0].get_location("HC Zeldas Letter")
+        item = location.item
+        search.state_list[0].collect(item)
+        collection_spheres[-1][item.location] = item.name
+        location = worlds[0].get_location("Song from Impa")
+        item = location.item
+        search.state_list[0].collect(item)
+        collection_spheres[-1][item.location] = item.name
+    
+    # Compute next spheres
+    had_reachable_locations = True
+    items_to_delay = []
+    items_to_collect = []
+    increment_sphere = True
+    while had_reachable_locations:
+        child_regions, adult_regions, visited_locations = search.next_sphere()
+        
+        if increment_sphere:
+            sphere_number += 1
+            collection_spheres.append({})
+            had_reachable_locations = False
+
+        location = None
+        for loc in all_locations:
+            if loc in visited_locations:
+                continue
+            # Check adult first; it's the most likely.
+            if (loc.parent_region in adult_regions
+                    and loc.access_rule(search.state_list[loc.world.id], spot=loc, age='adult')):
+                had_reachable_locations = True
+                # Mark it visited for this algorithm
+                visited_locations.add(loc)
+                location = loc
+
+            elif (loc.parent_region in child_regions
+                  and loc.access_rule(search.state_list[loc.world.id], spot=loc, age='child')):
+                had_reachable_locations = True
+                # Mark it visited for this algorithm
+                visited_locations.add(loc)
+                location = loc
+            
+            # If location is reachable, add its item to the right list
+            if location:
+                item = location.item
+                if location in collection_spheres[0]:
+                    # If the location was already in sphere -1, ignore it
+                    pass
+                elif is_noteworthy(item):
+                    items_to_delay.append(location.item)
+                else:
+                    items_to_collect.append(location.item)
+                location = None
+        
+        # If some non-remarkable items have been found, collect them and don't open a new sphere
+        if len(items_to_collect) > 0:
+            for item in items_to_collect:
+                search.state_list[item.world.id].collect(item)
+                if must_be_logged(item, False):
+                    collection_spheres[-1][item.location] = item.name
+            items_to_collect = []
+            increment_sphere = False
+            had_reachable_locations = True
+        # Otherwise collect everything remarkable met in the current sphere and open a new one
+        else:
+            for item in items_to_delay:
+                search.state_list[item.world.id].collect(item)
+                if must_be_logged(item, True):
+                    collection_spheres[-1][item.location] = item.name
+            items_to_delay = []
+            increment_sphere = True
+    
+    # Remove possibly empty spheres at the tail
+    while len(collection_spheres) > 0 and len(collection_spheres[-1]) == 0:
+        del collection_spheres[-1]
+    spoiler.coarse_spheres = OrderedDict((str(i-1), {location: location.item for location in sphere}) for i, sphere in enumerate(collection_spheres))
+    
+def update_required_items(spoiler):
+    worlds = spoiler.worlds
+
+    # get list of all of the progressive items that can appear in hints
+    # all_locations: all progressive items. have to collect from these
+    # item_locations: only the ones that should appear as "required"/WotH
+    all_locations = [location for world in worlds for location in world.get_filled_locations()]
+    # Set to test inclusion against
+    item_locations = {location for location in all_locations if location.item.majoritem and not location.locked and location.item.name != 'Triforce Piece'}
+
+    # if the playthrough was generated, filter the list of locations to the
+    # locations in the playthrough. The required locations is a subset of these
+    # locations. Can't use the locations directly since they are location to the
+    # copied spoiler world, so must compare via name and world id
+    if spoiler.playthrough:
+        translate = lambda loc: worlds[loc.world.id].get_location(loc.name)
+        spoiler_locations = set(map(translate, itertools.chain.from_iterable(spoiler.playthrough.values())))
+        item_locations &= spoiler_locations
+        # Skip even the checks
+        _maybe_set_light_arrows = lambda _: None
+    else:
+        _maybe_set_light_arrows = maybe_set_light_arrows
+
+    required_locations = []
+
+    search = Search([world.state for world in worlds])
+
+    for location in search.iter_reachable_locations(all_locations):
+        # Try to remove items one at a time and see if the game is still beatable
+        if location in item_locations:
+            old_item = location.item
+            location.item = None
+            # copies state! This is very important as we're in the middle of a search
+            # already, but beneficially, has search it can start from
+            if not search.can_beat_game():
+                required_locations.append(location)
+            location.item = old_item
+            _maybe_set_light_arrows(location)
+        search.state_list[location.item.world.id].collect(location.item)
+
+    # Filter the required location to only include location in the world
+    required_locations_dict = {}
+    for world in worlds:
+        required_locations_dict[world.id] = list(filter(lambda location: location.world.id == world.id, required_locations))
+    spoiler.required_locations = required_locations_dict
+
+
+
+def create_playthrough(spoiler):
+    logger = logging.getLogger('')
+    worlds = spoiler.worlds
+    if worlds[0].check_beatable_only and not Search([world.state for world in worlds]).can_beat_game():
+        raise RuntimeError('Game unbeatable after placing all items.')
+    # create a copy as we will modify it
+    old_worlds = worlds
+    worlds = copy_worlds(worlds)
+
+    # if we only check for beatable, we can do this sanity check first before writing down spheres
+    if worlds[0].check_beatable_only and not Search([world.state for world in worlds]).can_beat_game():
+        raise RuntimeError('Uncopied world beatable but copied world is not.')
+
+    search = RewindableSearch([world.state for world in worlds])
+    logger.debug('Initial search: %s', search.state_list[0].get_prog_items())
+    # Get all item locations in the worlds
+    item_locations = search.progression_locations()
+    # Omit certain items from the playthrough
+    internal_locations = {location for location in item_locations if location.internal}
+    # Generate a list of spheres by iterating over reachable locations without collecting as we go.
+    # Collecting every item in one sphere means that every item
+    # in the next sphere is collectable. Will contain every reachable item this way.
+    logger.debug('Building up collection spheres.')
+    collection_spheres = []
+    entrance_spheres = []
+    remaining_entrances = set(entrance for world in worlds for entrance in world.get_shuffled_entrances())
+
+    search.checkpoint()
+    search.collect_pseudo_starting_items()
+    logger.debug('With pseudo starting items: %s', search.state_list[0].get_prog_items())
+
+    while True:
+        search.checkpoint()
+        # Not collecting while the generator runs means we only get one sphere at a time
+        # Otherwise, an item we collect could influence later item collection in the same sphere
+        collected = list(search.iter_reachable_locations(item_locations))
+        if not collected: break
+        random.shuffle(collected)
+        # Gather the new entrances before collecting items.
+        collection_spheres.append(collected)
+        accessed_entrances = set(filter(search.spot_access, remaining_entrances))
+        entrance_spheres.append(list(accessed_entrances))
+        remaining_entrances -= accessed_entrances
+        for location in collected:
+            # Collect the item for the state world it is for
+            search.state_list[location.item.world.id].collect(location.item)
+            maybe_set_misc_item_hints(location)
+    logger.info('Collected %d spheres', len(collection_spheres))
+    spoiler.full_playthrough = dict((location.name, i + 1) for i, sphere in enumerate(collection_spheres) for location in sphere)
+    spoiler.max_sphere = len(collection_spheres)
+
+    # Reduce each sphere in reverse order, by checking if the game is beatable
+    # when we remove the item. We do this to make sure that progressive items
+    # like bow and slingshot appear as early as possible rather than as late as possible.
+    required_locations = []
+    for sphere in reversed(collection_spheres):
+        random.shuffle(sphere)
+        for location in sphere:
+            # we remove the item at location and check if the game is still beatable in case the item could be required
+            old_item = location.item
+
+            # Uncollect the item and location.
+            search.state_list[old_item.world.id].remove(old_item)
+            search.unvisit(location)
+
+            # Generic events might show up or not, as usual, but since we don't
+            # show them in the final output, might as well skip over them. We'll
+            # still need them in the final pass, so make sure to include them.
+            if location.internal:
+                required_locations.append(location)
+                continue
+
+            location.item = None
+
+            # An item can only be required if it isn't already obtained or if it's progressive
+            if search.state_list[old_item.world.id].item_count(old_item.solver_id) < old_item.world.max_progressions[old_item.name]:
+                # Test whether the game is still beatable from here.
+                logger.debug('Checking if %s is required to beat the game.', old_item.name)
+                if not search.can_beat_game():
+                    # still required, so reset the item
+                    location.item = old_item
+                    required_locations.append(location)
+
+    # Reduce each entrance sphere in reverse order, by checking if the game is beatable when we disconnect the entrance.
+    required_entrances = []
+    for sphere in reversed(entrance_spheres):
+        random.shuffle(sphere)
+        for entrance in sphere:
+            # we disconnect the entrance and check if the game is still beatable
+            old_connected_region = entrance.disconnect()
+
+            # we use a new search to ensure the disconnected entrance is no longer used
+            sub_search = Search([world.state for world in worlds])
+
+            # Test whether the game is still beatable from here.
+            logger.debug('Checking if reaching %s, through %s, is required to beat the game.', old_connected_region.name, entrance.name)
+            if not sub_search.can_beat_game():
+                # still required, so reconnect the entrance
+                entrance.connect(old_connected_region)
+                required_entrances.append(entrance)
+
+    # Regenerate the spheres as we might not reach places the same way anymore.
+    search.reset() # search state has no items, okay to reuse sphere 0 cache
+    collection_spheres = []
+    collection_spheres.append(list(filter(lambda loc: loc.item.advancement and loc.item.world.max_progressions[loc.item.name] > 0, search.iter_pseudo_starting_locations())))
+    entrance_spheres = []
+    remaining_entrances = set(required_entrances)
+    collected = set()
+    while True:
+        # Not collecting while the generator runs means we only get one sphere at a time
+        # Otherwise, an item we collect could influence later item collection in the same sphere
+        collected.update(search.iter_reachable_locations(required_locations))
+        if not collected: break
+        internal = collected & internal_locations
+        if internal:
+            # collect only the internal events but don't record them in a sphere
+            for location in internal:
+                search.state_list[location.item.world.id].collect(location.item)
+            # Remaining locations need to be saved to be collected later
+            collected -= internal
+            continue
+        # Gather the new entrances before collecting items.
+        collection_spheres.append(list(collected))
+        accessed_entrances = set(filter(search.spot_access, remaining_entrances))
+        entrance_spheres.append(accessed_entrances)
+        remaining_entrances -= accessed_entrances
+        for location in collected:
+            # Collect the item for the state world it is for
+            search.state_list[location.item.world.id].collect(location.item)
+        collected.clear()
+    logger.info('Collected %d final spheres', len(collection_spheres))
+
+    if not search.can_beat_game(False):
+        logger.error('Playthrough could not beat the game!')
+        # Add temporary debugging info or breakpoint here if this happens
+
+    # Then we can finally output our playthrough
+    spoiler.playthrough = OrderedDict((str(i), {location: location.item for location in sphere}) for i, sphere in enumerate(collection_spheres))
+    # Copy our misc. hint items, since we set them in the world copy
+    for w, sw in zip(worlds, spoiler.worlds):
+        # But the actual location saved here may be in a different world
+        for item_name, item_location in w.hinted_dungeon_reward_locations.items():
+            sw.hinted_dungeon_reward_locations[item_name] = spoiler.worlds[item_location.world.id].get_location(item_location.name)
+        for hint_type, item_location in w.misc_hint_item_locations.items():
+            sw.misc_hint_item_locations[hint_type] = spoiler.worlds[item_location.world.id].get_location(item_location.name)
+
+    if worlds[0].entrance_shuffle:
+        spoiler.entrance_playthrough = OrderedDict((str(i + 1), list(sphere)) for i, sphere in enumerate(entrance_spheres))
+>>>>>>> df604360 (Implements coarse spheres + last woth)

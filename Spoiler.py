@@ -70,7 +70,7 @@ class Spoiler:
         self.goal_categories: dict[int, dict[str, GoalCategory]] = {}
         self.hints: dict[int, dict[int, GossipText]] = {world.id: {} for world in worlds}
         self.file_hash: list[int] = []
-
+		self.coarse_spheres = {}
     def build_file_hash(self) -> None:
         dist_file_hash = self.settings.distribution.file_hash
         for i in range(5):
