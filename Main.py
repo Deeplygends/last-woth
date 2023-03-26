@@ -16,17 +16,23 @@ import time
 import zipfile
 from typing import Optional
 
-
+from Rom import Rom
+from Patches import patch_rom
 from Cosmetics import CosmeticsLog, patch_cosmetics
 from EntranceShuffle import set_entrances
 from Dungeon import create_dungeons
+from DungeonList import create_dungeons
 from Fill import distribute_items_restrictive, ShuffleError
 from Goals import update_goal_items, maybe_set_misc_item_hints, replace_goal_names
 from Hints import buildGossipHints
 from HintList import clear_hint_exclusion_cache, misc_item_hint_table, misc_location_hint_table
 from Item import Item
 from ItemPool import generate_itempool
+from Hints import buildGossipHints
+from HintList import clearHintExclusionCache
+from N64Patch import create_patch_file, apply_patch_file
 from MBSDIFFPatch import apply_ootr_3_web_patch
+
 from HintList import clearHintExclusionCache, misc_item_hint_table, misc_location_hint_table
 from Models import patch_model_adult, patch_model_child
 from N64Patch import create_patch_file, apply_patch_file
@@ -44,8 +50,9 @@ from SettingsList import setting_infos, logic_tricks
 from Spoiler import Spoiler
 from Utils import default_output_path, is_bundled, run_process, data_path
 from World import World
-
 from version import __version__
+
+
 
 
 def main(settings: Settings, max_attempts: int = 10) -> Spoiler:

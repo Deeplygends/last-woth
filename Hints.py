@@ -569,8 +569,7 @@ def get_woth_hint(spoiler: Spoiler, world: World, checked: set[str]) -> HintRetu
         world.woth_dungeon += 1
     location_text = hint_area.text(world.settings.clearer_hints)
 
-    return GossipText('%s is on the way of the hero.' % location_text, ['Light Blue'], [location.name], [location.item.name]), [location]
-	#return (GossipText(hint_text % location_text, [hint_color], [location.name], [location.item.name]), [location])
+    return (GossipText(hint_text % location_text, [hint_color], [location.name], [location.item.name]), [location])
 
 
 def get_checked_areas(world: World, checked: set[str]) -> set[HintArea | str]:
